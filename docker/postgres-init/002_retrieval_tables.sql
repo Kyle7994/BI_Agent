@@ -1,3 +1,5 @@
+-- 002_retrieval_tables.sql
+
 CREATE TABLE schema_chunks (
     id BIGSERIAL PRIMARY KEY,
     chunk_type VARCHAR(32) NOT NULL,

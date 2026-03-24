@@ -1,3 +1,5 @@
+<!-- README.md -->
+
 # 🧠 Explainable BI Agent (InsightSQL)
 
 Turn natural language into production-ready SQL — with reasoning.

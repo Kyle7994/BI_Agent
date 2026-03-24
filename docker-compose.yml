@@ -75,12 +75,19 @@ services:
 
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_URL: redis://redis:6379/0
 
       LLM_BASE_URL: http://ollama:11434
       LLM_MODEL: llama3
       EMBED_MODEL: nomic-embed-text
 
-      ENABLE_ADMIN_OPS: "true"
+      PROMPT_VERSION: prompt_v4
+      GUARD_VERSION: guard_v3
+      VALIDATOR_VERSION: validator_v2
+      EXAMPLES_VERSION: examples_v1
+
+      ENABLE_ADMIN_OPS: "false"
     ports:
       - "8000:8000"
     volumes:

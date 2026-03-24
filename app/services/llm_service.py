@@ -104,4 +104,4 @@ Ensure the SQL is valid MySQL and follows the rules.
         )
         resp.raise_for_status()
         result = json.loads(resp.json()["response"].strip())
-        return result.get("query_plan", ""), result.get("sql", ""), result.get("uncertainty_note", None)
+        return result.get("query_plan", ""), result.get("sql") or "", result.get("uncertainty_note", None)

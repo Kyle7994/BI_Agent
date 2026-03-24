@@ -99,7 +99,9 @@ async def query_run(req: QueryRequest):
             
             # 调纠错模型
             query_plan, sql, uncertainty = await repair_sql(req.question, first_error, sql, schema_context)
-            
+            if not sql:
+                raise ValueError("AI could not generate a valid fix for this question.")
+            # 修改这一行，确保变量名对得上，且能打印出来
             print(f"♻️ [Repair Success] New SQL: {sql}")
             checked_sql = validate_sql(sql)
             columns, rows = run_query(checked_sql)

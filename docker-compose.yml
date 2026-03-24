@@ -12,6 +12,8 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
       - ./docker/mysql-init:/docker-entrypoint-initdb.d
+    networks:
+      - bi_net
 
   postgres:
     image: pgvector/pgvector:pg17
@@ -25,6 +27,8 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./docker/postgres-init:/docker-entrypoint-initdb.d
+    networks:
+      - bi_net
 
   redis:
     image: redis:7
@@ -33,6 +37,8 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    networks:
+      - bi_net
 
   ollama:
     image: ollama/ollama
@@ -41,6 +47,8 @@ services:
       - "11500:11434"
     volumes:
       - ollama_data:/root/.ollama
+    networks:
+      - bi_net
 
   api:
     build:
@@ -70,6 +78,9 @@ services:
 
       LLM_BASE_URL: http://ollama:11434
       LLM_MODEL: llama3
+      EMBED_MODEL: nomic-embed-text
+
+      ENABLE_ADMIN_OPS: "true"
     ports:
       - "8000:8000"
     volumes:
@@ -78,9 +89,15 @@ services:
     command: >
       sh -c "pip install -r requirements.txt &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    networks:
+      - bi_net
 
 volumes:
   mysql_data:
   pg_data:
   redis_data:
   ollama_data:
+
+networks:
+  bi_net:
+    driver: bridge

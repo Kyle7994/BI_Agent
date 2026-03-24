@@ -4,7 +4,7 @@ CREATE TABLE schema_chunks (
     source_name VARCHAR(128) NOT NULL,
     content TEXT NOT NULL,
     metadata JSONB NOT NULL,
-    embedding VECTOR(1536)
+    embedding VECTOR(768) 
 );
 
 CREATE TABLE sql_examples (
@@ -12,5 +12,5 @@ CREATE TABLE sql_examples (
     question TEXT NOT NULL,
     sql_text TEXT NOT NULL,
     features JSONB NOT NULL,
-    embedding VECTOR(1536)
+    embedding VECTOR(768)
 );

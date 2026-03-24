@@ -1,0 +1,86 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: bi_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: ecommerce
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: bi_pgvector
+    environment:
+      POSTGRES_DB: retrieval
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d
+
+  redis:
+    image: redis:7
+    container_name: bi_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  ollama:
+    image: ollama/ollama
+    container_name: bi_ollama
+    ports:
+      - "11500:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: bi_api
+    depends_on:
+      - mysql
+      - postgres
+      - redis
+      - ollama
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DB: ecommerce
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppass
+
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DB: retrieval
+      PG_USER: pguser
+      PG_PASSWORD: pgpass
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      LLM_BASE_URL: http://ollama:11434
+      LLM_MODEL: mistral
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+      - ./requirements.txt:/app/requirements.txt
+    command: >
+      sh -c "pip install -r requirements.txt &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+volumes:
+  mysql_data:
+  pg_data:
+  redis_data:
+  ollama_data:

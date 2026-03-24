@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+sqlalchemy
+pymysql
+psycopg[binary]
+redis
+httpx
+sqlglot
+pgvector

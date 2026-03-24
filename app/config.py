@@ -20,3 +20,5 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://ollama:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
+
+ENABLE_ADMIN_OPS = os.getenv("ENABLE_ADMIN_OPS", "false").lower() == "true"

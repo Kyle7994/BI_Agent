@@ -10,3 +10,4 @@ redis
 PyYAML
 tqdm
 cryptography
+cachetools>=5.3.3

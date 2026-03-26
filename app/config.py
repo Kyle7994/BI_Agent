@@ -80,3 +80,6 @@ HTTP_POOL_TIMEOUT = float(os.getenv("HTTP_POOL_TIMEOUT", "5"))
 # A flag to enable or disable potentially destructive SQL operations (e.g., DELETE, UPDATE).
 # This acts as a safety guardrail. Set to "true" to allow admin-level operations.
 ENABLE_ADMIN_OPS = os.getenv("ENABLE_ADMIN_OPS", "false").lower() == "true"
+
+
+SQL_EXAMPLE_LIMIT = int(os.getenv("SQL_EXAMPLE_LIMIT", "1"))

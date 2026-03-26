@@ -3,43 +3,53 @@
 """
 app/services/redis_service.py
 
-This module implements the caching layer for the Text-to-SQL application using Redis.
+This module implements the caching layer for the Text-to-SQL application.
 
-It provides a sophisticated caching mechanism to store both successful SQL generation
-results and deliberate rejections. The cache aims to:
-- Reduce latency for repeated questions.
-- Minimize redundant calls to the LLM, saving costs and resources.
-- Ensure cache integrity through a versioned fingerprinting system.
+It provides a two-level cache:
+- L1: process-local TTL cache for ultra-fast repeat hits within one API worker
+- L2: Redis distributed cache for cross-worker / cross-instance sharing
 
-The cache key is a hash composed of the user's question and versions of all major
-system components (prompt, model, schema, etc.). This ensures that if any part
-of the generation pipeline changes, the cache is automatically invalidated.
+The cache key is a versioned fingerprint over:
+- normalized question
+- schema version
+- prompt/model/guard/validator/examples versions
+- cache structure version
 """
 
-import json
+from __future__ import annotations
+
+import copy
 import hashlib
+import json
 import os
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
-import redis
 
-from app.config import REDIS_URL, LLM_MODEL
+import redis
+from cachetools import TTLCache
+
+from app.config import LLM_MODEL, REDIS_URL
 
 # ===================================
 # Cache Configuration
 # ===================================
 CACHE_ENV = os.getenv("CACHE_ENV", "dev")
-SUCCESS_TTL_SECONDS = int(os.getenv("SUCCESS_TTL_SECONDS", "3600"))  # 1 hour
-REJECT_TTL_SECONDS = int(os.getenv("REJECT_TTL_SECONDS", "300"))    # 5 minutes
+SUCCESS_TTL_SECONDS = int(os.getenv("SUCCESS_TTL_SECONDS", "3600"))   # 1 hour
+REJECT_TTL_SECONDS = int(os.getenv("REJECT_TTL_SECONDS", "300"))      # 5 minutes
+
+# L1 local cache
+L1_CACHE_MAXSIZE = int(os.getenv("L1_CACHE_MAXSIZE", "1024"))
+L1_CACHE_TTL_SECONDS = int(os.getenv("L1_CACHE_TTL_SECONDS", "60"))
+_l1_cache: TTLCache[str, dict[str, Any]] = TTLCache(
+    maxsize=L1_CACHE_MAXSIZE,
+    ttl=L1_CACHE_TTL_SECONDS,
+)
 
 # ===================================
 # Cache Versioning
-#
-# These versions are part of the cache key. Bumping any of these versions
-# effectively invalidates the entire cache, forcing regeneration of responses.
 # ===================================
-CACHE_VERSION = "v3"  # Global version for the cache structure itself.
+CACHE_VERSION = "v4"
 PROMPT_VERSION = os.getenv("PROMPT_VERSION", "prompt_v4")
 GUARD_VERSION = os.getenv("GUARD_VERSION", "guard_v3")
 VALIDATOR_VERSION = os.getenv("VALIDATOR_VERSION", "validator_v2")
@@ -67,7 +77,7 @@ redis_client = redis.Redis.from_url(
 # ===================================
 
 def _make_json_safe(value: Any) -> Any:
-    """Recursively converts non-JSON-serializable types (Decimal, datetime) to strings."""
+    """Recursively converts non-JSON-serializable types to JSON-safe values."""
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, (datetime, date)):
@@ -86,10 +96,16 @@ def utc_now_iso() -> str:
 
 def normalize_question(question: str) -> str:
     """
-    Normalizes a question for caching by converting to lowercase, stripping whitespace,
-    and collapsing multiple spaces.
+    Normalizes a question for caching by converting to lowercase,
+    stripping whitespace, and collapsing multiple spaces.
     """
     return " ".join(question.strip().lower().split())
+
+
+def clear_local_cache() -> None:
+    """Clears the in-process L1 cache. Useful in tests or manual admin flows."""
+    _l1_cache.clear()
+
 
 # ===================================
 # Dynamic Version Management
@@ -100,7 +116,6 @@ def set_current_schema_version(schema_version: str) -> None:
     try:
         redis_client.set(CURRENT_SCHEMA_VERSION_KEY, schema_version)
     except redis.RedisError:
-        # Fail silently if Redis is unavailable.
         pass
 
 
@@ -121,14 +136,12 @@ def get_current_examples_version() -> str:
 
 
 def bump_examples_version() -> str:
-    """Increments the version of the few-shot examples, effectively invalidating related caches."""
+    """Increments the few-shot examples version, invalidating related caches."""
     current = get_current_examples_version()
     try:
-        # Assumes version is in "examples_v<number>" format.
         suffix = int(current.rsplit("v", 1)[1])
         new_version = f"examples_v{suffix + 1}"
     except (IndexError, ValueError):
-        # Fallback if the format is unexpected.
         new_version = f"{DEFAULT_EXAMPLES_VERSION}_bumped_at_{utc_now_iso()}"
 
     try:
@@ -139,10 +152,9 @@ def bump_examples_version() -> str:
 
 
 def _resolve_examples_version(examples_version: str | None = None) -> str:
-    """
-    A helper to use the provided examples_version or fall back to the global one.
-    """
+    """Use the provided examples_version or fall back to the global one."""
     return examples_version or get_current_examples_version()
+
 
 # ===================================
 # Cache Key Generation
@@ -158,13 +170,11 @@ def compute_fingerprint(
     examples_version: str | None = None,
 ) -> str:
     """
-    Computes a SHA256 hash based on the question and all relevant component versions.
-    This fingerprint uniquely identifies a query context.
+    Computes a SHA256 fingerprint for the query context.
     """
     normalized_question = normalize_question(question)
     resolved_examples_version = _resolve_examples_version(examples_version)
 
-    # Concatenate all versioned components into a single string.
     raw = "||".join(
         [
             normalized_question,
@@ -189,27 +199,24 @@ def build_cache_key(
     validator_version: str = VALIDATOR_VERSION,
     examples_version: str | None = None,
 ) -> str:
-    """Constructs the full Redis cache key from the computed fingerprint."""
+    """Constructs the full cache key from the computed fingerprint."""
     fp = compute_fingerprint(
-        question=question, schema_version=schema_version,
-        prompt_version=prompt_version, model_name=model_name,
-        guard_version=guard_version, validator_version=validator_version,
+        question=question,
+        schema_version=schema_version,
+        prompt_version=prompt_version,
+        model_name=model_name,
+        guard_version=guard_version,
+        validator_version=validator_version,
         examples_version=examples_version,
     )
     return f"nl2sql:cache:{CACHE_ENV}:{fp}"
 
+
 # ===================================
-# Cache Read/Write Operations
+# Internal Read/Write Helpers
 # ===================================
 
-def get_cached_response(question: str, schema_version: str, **kwargs) -> Optional[dict[str, Any]]:
-    """
-    Retrieves a cached response from Redis.
-
-    It builds the cache key, fetches the data, and performs validation checks
-    (e.g., ensuring the cache_version matches) before returning the payload.
-    """
-    key = build_cache_key(question=question, schema_version=schema_version, **kwargs)
+def _load_payload_from_redis(key: str) -> Optional[dict[str, Any]]:
     try:
         raw = redis_client.get(key)
     except redis.RedisError:
@@ -221,14 +228,12 @@ def get_cached_response(question: str, schema_version: str, **kwargs) -> Optiona
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        # Delete corrupted data from the cache.
         try:
             redis_client.delete(key)
         except redis.RedisError:
             pass
         return None
 
-    # Invalidate if the cache item was created with an old cache structure.
     if payload.get("cache_version") != CACHE_VERSION:
         try:
             redis_client.delete(key)
@@ -239,71 +244,148 @@ def get_cached_response(question: str, schema_version: str, **kwargs) -> Optiona
     return payload
 
 
-def set_cached_success(
-    question: str, schema_version: str, query_plan: str, sql: str,
-    columns: list[str], rows: list[list[Any]],
-    uncertainty_note: str | None = None, ttl_seconds: int = SUCCESS_TTL_SECONDS,
-    **kwargs
-) -> None:
-    """Stores a successful SQL generation result in the cache."""
-    key = build_cache_key(question=question, schema_version=schema_version, **kwargs)
-    payload = {
-        "status": "success", "question": question, "sql": sql,
-        "query_plan": query_plan, "columns": columns, "rows": rows,
-        "uncertainty_note": uncertainty_note, "answerable": True, "error": None,
-        "schema_version": schema_version, "cache_version": CACHE_VERSION,
-        "created_at": utc_now_iso(), "ttl_seconds": ttl_seconds,
-        **kwargs
-    }
+def _write_both_levels(key: str, payload: dict[str, Any], ttl_seconds: int) -> None:
+    safe_payload = _make_json_safe(payload)
+
+    # L1 write
+    _l1_cache[key] = copy.deepcopy(safe_payload)
+
+    # L2 write
     try:
-        safe_payload = _make_json_safe(payload)
         redis_client.setex(key, ttl_seconds, json.dumps(safe_payload, ensure_ascii=False))
     except redis.RedisError:
         pass
+
+
+# ===================================
+# Cache Read/Write Operations
+# ===================================
+
+def get_cached_response(question: str, schema_version: str, **kwargs) -> Optional[dict[str, Any]]:
+    """
+    Retrieves a cached response.
+
+    Order:
+    1. L1 process-local TTL cache
+    2. L2 Redis cache
+    """
+    key = build_cache_key(question=question, schema_version=schema_version, **kwargs)
+
+    # L1
+    local_payload = _l1_cache.get(key)
+    if local_payload is not None:
+        payload = copy.deepcopy(local_payload)
+        payload["cache_level"] = "L1"
+        return payload
+
+    # L2
+    payload = _load_payload_from_redis(key)
+    if payload is None:
+        return None
+
+    # Promote to L1
+    _l1_cache[key] = copy.deepcopy(payload)
+
+    payload = copy.deepcopy(payload)
+    payload["cache_level"] = "L2"
+    return payload
+
+
+def set_cached_success(
+    question: str,
+    schema_version: str,
+    query_plan: str,
+    sql: str,
+    columns: list[str],
+    rows: list[list[Any]],
+    uncertainty_note: str | None = None,
+    ttl_seconds: int = SUCCESS_TTL_SECONDS,
+    **kwargs,
+) -> None:
+    """Stores a successful result in both L1 and L2 caches."""
+    key = build_cache_key(question=question, schema_version=schema_version, **kwargs)
+    payload = {
+        "status": "success",
+        "question": question,
+        "sql": sql,
+        "query_plan": query_plan,
+        "columns": columns,
+        "rows": rows,
+        "uncertainty_note": uncertainty_note,
+        "answerable": True,
+        "error": None,
+        "schema_version": schema_version,
+        "cache_version": CACHE_VERSION,
+        "created_at": utc_now_iso(),
+        "ttl_seconds": ttl_seconds,
+        **kwargs,
+    }
+    _write_both_levels(key, payload, ttl_seconds)
 
 
 def set_cached_rejection(
-    question: str, schema_version: str, query_plan: str, reason: str,
-    uncertainty_note: str | None = None, ttl_seconds: int = REJECT_TTL_SECONDS,
-    **kwargs
+    question: str,
+    schema_version: str,
+    query_plan: str,
+    reason: str,
+    uncertainty_note: str | None = None,
+    ttl_seconds: int = REJECT_TTL_SECONDS,
+    **kwargs,
 ) -> None:
-    """Stores a rejection (i.e., the question was deemed unanswerable) in the cache."""
+    """Stores an explicit rejection result in both L1 and L2 caches."""
     key = build_cache_key(question=question, schema_version=schema_version, **kwargs)
     payload = {
-        "status": "rejected", "question": question, "sql": None,
-        "query_plan": query_plan, "columns": [], "rows": [],
-        "uncertainty_note": uncertainty_note, "answerable": False, "error": reason,
-        "schema_version": schema_version, "cache_version": CACHE_VERSION,
-        "created_at": utc_now_iso(), "ttl_seconds": ttl_seconds,
-        **kwargs
+        "status": "rejected",
+        "question": question,
+        "sql": None,
+        "query_plan": query_plan,
+        "columns": [],
+        "rows": [],
+        "uncertainty_note": uncertainty_note,
+        "answerable": False,
+        "error": reason,
+        "schema_version": schema_version,
+        "cache_version": CACHE_VERSION,
+        "created_at": utc_now_iso(),
+        "ttl_seconds": ttl_seconds,
+        **kwargs,
     }
-    try:
-        safe_payload = _make_json_safe(payload)
-        redis_client.setex(key, ttl_seconds, json.dumps(safe_payload, ensure_ascii=False))
-    except redis.RedisError:
-        pass
+    _write_both_levels(key, payload, ttl_seconds)
+
 
 # ===================================
 # Cache Decision Logic
 # ===================================
 
 def should_cache_success(
-    *, error_msg: str | None, is_cached: bool, answerable: bool,
-    checked_sql: str | None, semantic_guard_passed: bool
+    *,
+    error_msg: str | None,
+    is_cached: bool,
+    answerable: bool,
+    checked_sql: str | None,
+    semantic_guard_passed: bool,
 ) -> bool:
     """Determines if a successful result is eligible for caching."""
     return (
-        error_msg is None and not is_cached and answerable and
-        checked_sql is not None and checked_sql.strip() != "" and
-        semantic_guard_passed
+        error_msg is None
+        and not is_cached
+        and answerable
+        and checked_sql is not None
+        and checked_sql.strip() != ""
+        and semantic_guard_passed
     )
 
 
 def should_cache_rejection(
-    *, is_cached: bool, answerable: bool, rejection_reason: str | None
+    *,
+    is_cached: bool,
+    answerable: bool,
+    rejection_reason: str | None,
 ) -> bool:
     """Determines if a rejection is eligible for caching."""
     return (
-        not is_cached and not answerable and
-        rejection_reason is not None and rejection_reason.strip() != ""
+        not is_cached
+        and not answerable
+        and rejection_reason is not None
+        and rejection_reason.strip() != ""
     )

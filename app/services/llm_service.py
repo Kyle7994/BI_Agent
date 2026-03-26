@@ -7,14 +7,17 @@ This module is the core of the Text-to-SQL agent, handling all interactions
 with the Large Language Model (LLM).
 
 It is responsible for:
-- Constructing detailed prompts for the LLM, including schema context and few-shot examples.
-- Calling the LLM API to generate SQL queries from natural language questions.
-- Calling the LLM API to repair incorrect SQL queries based on execution errors.
-- Parsing and validating the JSON responses from the LLM.
-- Implementing resilient communication with retry logic for transient errors.
+- Constructing prompts for the LLM, including schema context and few-shot examples
+- Calling the LLM API to generate SQL
+- Calling the LLM API to repair incorrect SQL
+- Parsing and validating JSON responses
+- Retrying transient HTTP failures
 """
 
+from __future__ import annotations
+
 import json
+
 import httpx
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
@@ -25,75 +28,130 @@ from app.config import (
     HTTP_WRITE_TIMEOUT,
     LLM_BASE_URL,
     LLM_MODEL,
+    SQL_EXAMPLE_LIMIT
 )
 from app.services.embedding_service import get_embedding
 from app.services.postgres_service import search_schema_chunks, search_sql_examples
 
-# A set of HTTP status codes that are considered transient and thus retryable.
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-# The base prompt template for generating SQL.
-# It provides the LLM with instructions, rules, and the expected JSON output format.
 BASE_PROMPT = """
+Return exactly one JSON object:
+{
+  "sql": "single executable MySQL SELECT statement or null",
+  "answerable": true,
+  "uncertainty_note": "brief assumption note or null",
+  "refusal_reason": "reason for refusal or null"
+}
+
 You are an expert MySQL SQL generator.
 
-You MUST return exactly one JSON object with this schema:
-{
-  "query_plan": "A step-by-step plan for how you will construct the query.",
-  "sql": "The generated SQL query, or null if not answerable.",
-  "uncertainty_note": "A brief note about any ambiguities or assumptions made, or null.",
-  "answerable": true,
-  "refusal_reason": "The reason for refusal if the question is not answerable, or null."
-}
-
-Rules:
-1. If answerable=true:
-   - "sql" MUST be a single, executable MySQL SELECT statement.
-   - Do not return markdown, comments, or explanations outside the JSON object.
-2. If answerable=false:
-   - "sql" MUST be null.
-   - "refusal_reason" MUST explain why the question cannot be answered safely.
-3. Prefer answerable=false over guessing.
-4. Refuse when:
-   - The question refers to tables or columns not present in the provided schema.
-   - The question depends on business definitions not present in the schema.
-   - Subjective words (e.g., 'recent', 'top', 'active') are undefined.
-   - A safe answer would require inventing joins, filters, or metrics.
-5. Never invent tables, columns, or business logic.
-6. Use only the tables and columns present in the 'Context Schema' section.
-7. For the 'uncertainty_note':
-   - Set to null if the question is fully grounded by the schema.
-   - Otherwise, explain the ambiguity briefly.
+Decision policy:
+1. Use only tables and columns present in Context Schema.
+2. If the question requires a business metric or concept that is not explicitly defined in the schema, return:
+   - answerable=false
+   - sql=null
+   - refusal_reason explaining the missing definition
+3. Examples of undefined business metrics/concepts that should usually be refused unless explicitly defined:
+   - ARPU
+   - LTV
+   - churn rate
+   - retention rate
+   - conversion rate
+   - growth rate
+4. If the question contains an ambiguous natural-language term that can be mapped to a reasonable schema-grounded interpretation, you may answer, but you MUST explain the interpretation in uncertainty_note.
+5. Examples of ambiguous but interpretable terms:
+   - active user -> may be interpreted as user with the most orders
+   - popular product -> may be interpreted as product with highest order quantity
+   - top country -> may be interpreted as country with highest order count or amount, depending on the question wording
+6. Never invent tables, columns, joins, filters, or business definitions not supported by the schema.
+7. If answerable=false:
+   - sql must be null
+   - refusal_reason must be non-null
+8. If answerable=true:
+   - sql must be a single executable MySQL SELECT statement
+   - uncertainty_note must be non-null whenever you make an interpretation or assumption
+9. Output JSON only. No markdown, no comments, no extra text.
 """
 
-# The prompt template for repairing a failed SQL query.
-# It instructs the LLM to fix a query based on the error message it produced.
-REPAIR_PROMPT = """
-You are an expert MySQL SQL repair assistant.
-
-You MUST return exactly one JSON object with this schema:
+DEBUG_PROMPT = """
+Return exactly one JSON object:
 {
-  "query_plan": "A step-by-step plan for how you will fix the query.",
-  "sql": "The corrected SQL query, or null if not repairable.",
-  "uncertainty_note": "A brief note about any ambiguities or assumptions made, or null.",
+  "query_plan": "short plan for how to build the query",
+  "sql": "single executable MySQL SELECT statement or null",
   "answerable": true,
-  "refusal_reason": "The reason for refusal if the query is not repairable, or null."
+  "uncertainty_note": "brief assumption note or null",
+  "refusal_reason": "reason for refusal or null"
 }
 
+You are an expert MySQL SQL generator.
+
+Decision policy:
+1. Use only tables and columns present in Context Schema.
+2. If the question requires a business metric or concept that is not explicitly defined in the schema, return:
+   - answerable=false
+   - sql=null
+   - refusal_reason explaining the missing definition
+3. Examples of undefined business metrics/concepts that should usually be refused unless explicitly defined:
+   - ARPU
+   - LTV
+   - churn rate
+   - retention rate
+   - conversion rate
+   - growth rate
+4. If the question contains an ambiguous natural-language term that can be mapped to a reasonable schema-grounded interpretation, you may answer, but you MUST explain the interpretation in uncertainty_note.
+5. Examples of ambiguous but interpretable terms:
+   - active user -> may be interpreted as user with the most orders
+   - popular product -> may be interpreted as product with highest order quantity
+   - top country -> may be interpreted as country with highest order count or amount, depending on the question wording
+6. query_plan must be concise.
+7. Never invent tables, columns, joins, filters, or business definitions not supported by the schema.
+8. If answerable=false:
+   - sql must be null
+   - refusal_reason must be non-null
+9. If answerable=true:
+   - sql must be a single executable MySQL SELECT statement
+   - uncertainty_note must be non-null whenever you make an interpretation or assumption
+10. Output JSON only. No markdown, no comments, no extra text.
+"""
+
+
+REPAIR_PROMPT = """
+Return exactly one JSON object:
+{
+  "sql": "corrected executable MySQL SELECT statement or null",
+  "answerable": true,
+  "uncertainty_note": "brief assumption note or null",
+  "refusal_reason": "reason for refusal or null"
+}
+
+You are an expert MySQL SQL repair assistant.
+
 Rules:
-1. Fix the SQL only if the user's question is answerable from the provided schema.
-2. If the question is not answerable, return answerable=false and sql=null.
-3. Never invent new tables, columns, or business logic.
-4. Return only a single JSON object.
-5. Focus: Use only the tables provided in the 'Context Schema' that are strictly necessary.
+1. Fix the SQL using only the provided schema.
+2. Preserve the user's original intent.
+3. Do not invent tables, columns, joins, filters, aliases, or business definitions not supported by the schema.
+4. If the original question requires an undefined business metric or concept, return:
+   - answerable=false
+   - sql=null
+   - refusal_reason explaining why the concept is not defined
+5. If the question is ambiguous but still reasonably answerable from the schema, keep the interpretation and explain it in uncertainty_note.
+6. Prefer minimal changes to the SQL instead of rewriting the entire query.
+7. Output JSON only. No markdown, no comments, no extra text.
 """
 
 
 def _should_retry_http(exc: BaseException) -> bool:
-    """
-    Determines if an HTTP request to the LLM should be retried based on the exception.
-    """
-    if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout)):
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.RemoteProtocolError,
+            httpx.PoolTimeout,
+        ),
+    ):
         return True
     if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
         return exc.response.status_code in RETRYABLE_STATUS_CODES
@@ -101,9 +159,6 @@ def _should_retry_http(exc: BaseException) -> bool:
 
 
 def _clean_json_text(raw_text: str) -> str:
-    """
-    Strips markdown formatting (like ```json ... ```) from the LLM's raw response.
-    """
     text = raw_text.strip()
     if text.startswith("```json"):
         text = text[7:]
@@ -115,9 +170,6 @@ def _clean_json_text(raw_text: str) -> str:
 
 
 def parse_llm_json_response(raw_text: str) -> dict:
-    """
-    Cleans and parses the LLM's text response into a Python dictionary.
-    """
     text = _clean_json_text(raw_text)
     if not text:
         raise ValueError("LLM returned an empty response.")
@@ -125,9 +177,6 @@ def parse_llm_json_response(raw_text: str) -> dict:
 
 
 def _format_examples_context(similar_examples: list[dict]) -> str:
-    """
-    Formats a list of few-shot examples into a string to be included in the prompt.
-    """
     if not similar_examples:
         return ""
     parts = ["Here are some similar verified examples for reference:"]
@@ -139,28 +188,13 @@ def _format_examples_context(similar_examples: list[dict]) -> str:
 
 
 async def build_generation_context(question: str) -> tuple[str, str]:
-    """
-    Constructs the full context needed for SQL generation by retrieving relevant
-    schema information and few-shot examples from the vector database.
-
-    Args:
-        question (str): The user's natural language question.
-
-    Returns:
-        A tuple containing the schema context string and the examples context string.
-    """
     question_embedding = await get_embedding(question)
 
-    # Find relevant table schemas based on semantic similarity to the question.
     relevant_schemas = search_schema_chunks(question_embedding, limit=4)
-    
-    # 【修改前】 schema_context = "\\n\\n".join(relevant_schemas).strip()
-    # 【修改后】 真正的换行符，外加一层全局替换防御旧数据
     schema_context = "\n\n".join(relevant_schemas).strip()
-    schema_context = schema_context.replace("\\n", "\n") 
+    schema_context = schema_context.replace("\\n", "\n")
 
-    # Find similar question/SQL pairs to use as few-shot examples.
-    similar_examples = search_sql_examples(question_embedding, limit=2)
+    similar_examples = search_sql_examples(question_embedding, limit=SQL_EXAMPLE_LIMIT)
     examples_context = _format_examples_context(similar_examples)
 
     return schema_context, examples_context
@@ -173,9 +207,6 @@ async def build_generation_context(question: str) -> tuple[str, str]:
     reraise=True,
 )
 async def _call_llm_json(prompt: str) -> dict:
-    """
-    A generic, retry-enabled function to call the LLM API and get a JSON response.
-    """
     timeout = httpx.Timeout(
         connect=HTTP_CONNECT_TIMEOUT,
         read=HTTP_READ_TIMEOUT,
@@ -204,32 +235,22 @@ async def generate_sql_from_question(
     question: str,
     schema_context: str | None = None,
     examples_context: str | None = None,
-) -> tuple[str, str | None, str | None, bool]:
-    """
-    Orchestrates the main Text-to-SQL generation process.
-
-    Args:
-        question (str): The user's natural language question.
-        schema_context (str, optional): Pre-fetched schema context.
-        examples_context (str, optional): Pre-fetched examples context.
-
-    Returns:
-        A tuple containing: (query_plan, sql, uncertainty_note, answerable).
-    """
+    debug: bool = False,
+) -> tuple[str | None, str | None, str | None, bool]:
     if schema_context is None or examples_context is None:
         schema_context, examples_context = await build_generation_context(question)
 
     if not schema_context:
         return (
-            # 【修改前】 "Step 1: Search for relevant schema.\\nStep 2: Refuse because no relevant schema was found.",
-            "Step 1: Search for relevant schema.\nStep 2: Refuse because no relevant schema was found.", # 【修改后】
+            "No relevant schema context was found." if debug else None,
             None,
             "No relevant schema context was found for this question.",
             False,
         )
 
-    # Assemble the final prompt.
-    prompt = f"""{BASE_PROMPT}
+    prompt_template = DEBUG_PROMPT if debug else BASE_PROMPT
+
+    prompt = f"""{prompt_template}
 
 Context Schema:
 {schema_context}
@@ -242,8 +263,7 @@ User question:
 
     result = await _call_llm_json(prompt)
 
-    # Safely extract data from the LLM's JSON response.
-    query_plan = result.get("query_plan") or "No plan generated."
+    query_plan = result.get("query_plan") if debug else None
     answerable = bool(result.get("answerable", False))
     refusal_reason = result.get("refusal_reason")
     uncertainty_note = result.get("uncertainty_note")
@@ -256,9 +276,12 @@ User question:
 
     if not answerable:
         sql = None
-        uncertainty_note = uncertainty_note or refusal_reason or "Question cannot be answered from the current schema."
+        uncertainty_note = (
+            uncertainty_note
+            or refusal_reason
+            or "Question cannot be answered from the current schema."
+        )
     elif not sql:
-        # Handle the case where the model claims it's answerable but provides no SQL.
         return (
             query_plan,
             None,
@@ -274,23 +297,7 @@ async def repair_sql(
     error_msg: str,
     wrong_sql: str,
     schema_context: str,
-) -> tuple[str, str | None, str | None]:
-    """
-    Attempts to repair a failed SQL query using the LLM.
-
-    It provides the LLM with the original question, the incorrect SQL, the
-    resulting error message, and the schema context.
-
-    Args:
-        question (str): The original user question.
-        error_msg (str): The error message from the database.
-        wrong_sql (str): The SQL query that failed.
-        schema_context (str): The schema context used for the original generation.
-
-    Returns:
-        A tuple containing: (query_plan, repaired_sql, uncertainty_note).
-    """
-    # Assemble the repair prompt.
+) -> tuple[str | None, str | None, str | None]:
     prompt = f"""{REPAIR_PROMPT}
 
 User Question:
@@ -308,7 +315,6 @@ Context Schema:
 
     result = await _call_llm_json(prompt)
 
-    query_plan = result.get("query_plan") or "No repair plan generated."
     answerable = bool(result.get("answerable", False))
     refusal_reason = result.get("refusal_reason")
     uncertainty_note = result.get("uncertainty_note")
@@ -320,9 +326,11 @@ Context Schema:
         sql = None
 
     if not answerable:
-        return query_plan, None, (uncertainty_note or refusal_reason or "Repair was refused.")
+        return None, None, (
+            uncertainty_note or refusal_reason or "Repair was refused."
+        )
 
     if not sql:
-        return query_plan, None, "Repair returned answerable=true but the SQL was empty."
+        return None, None, "Repair returned answerable=true but the SQL was empty."
 
-    return query_plan, sql, uncertainty_note
+    return None, sql, uncertainty_note
